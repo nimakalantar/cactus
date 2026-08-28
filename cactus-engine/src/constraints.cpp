@@ -242,7 +242,16 @@ bool ToolCallConstrainer::needle_is_value_string_start() const {
 void ToolCallConstrainer::feed_needle_char(char ch) {
     if (region_ == Region::IN_NAME || region_ == Region::IN_ARG_KEY) {
         if (ch == '"') {
-            if (region_ == Region::IN_NAME) current_function_ = constrained_buf_;
+            if (region_ == Region::IN_NAME) {
+                current_function_ = constrained_buf_;
+            } else {
+                active_enum_trie_ = nullptr;
+                auto fit = enum_tries_.find(current_function_);
+                if (fit != enum_tries_.end()) {
+                    auto kit = fit->second.find(constrained_buf_);
+                    if (kit != fit->second.end()) active_enum_trie_ = kit->second.get();
+                }
+            }
             constrained_buf_.clear();
             region_ = Region::FREE;
         } else {
@@ -263,7 +272,13 @@ void ToolCallConstrainer::feed_needle_char(char ch) {
             prev_char_escape_ = true;
             return;
         }
-        if (ch == '"') in_string_value_ = false;
+        if (ch == '"') {
+            in_string_value_ = false;
+            active_enum_trie_ = nullptr;
+            constrained_buf_.clear();
+        } else if (active_enum_trie_) {
+            constrained_buf_.push_back(ch);
+        }
         return;
     }
 
@@ -300,6 +315,7 @@ void ToolCallConstrainer::feed_needle_char(char ch) {
 
     if (ch == '"' && needle_is_value_string_start()) {
         in_string_value_ = true;
+        constrained_buf_.clear();
     }
 }
 
@@ -549,7 +565,14 @@ void ToolCallConstrainer::compute_bias() {
         return;
     }
 
-    if (is_needle()) return;
+    if (is_needle()) {
+        if (active_enum_trie_ && in_string_value_) {
+            mark_trie_bias(
+                trie_seek(active_enum_trie_, constrained_buf_), '"', {}
+            );
+        }
+        return;
+    }
 
     switch (state_) {
         case State::GEMMA_START:

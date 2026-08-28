@@ -12,13 +12,17 @@ from fastapi.testclient import TestClient
 import cactus.server as server
 
 
-def _bundle(root: Path, name: str, model_type: str, *, manifest: bool = True) -> Path:
+def _bundle(
+    root: Path,
+    name: str,
+    model_type: str,
+    *,
+    manifest: bool = True,
+) -> Path:
     path = root / name
     path.mkdir(parents=True)
-    (path / "config.txt").write_text(
-        f"model_type={model_type}\ncontext_length=1024\n",
-        encoding="utf-8",
-    )
+    config = [f"model_type={model_type}", "context_length=1024"]
+    (path / "config.txt").write_text("\n".join(config) + "\n", encoding="utf-8")
     if manifest:
         (path / "components").mkdir()
         (path / "components" / "manifest.json").write_text('{"components":[]}', encoding="utf-8")
@@ -44,6 +48,7 @@ def test_models_lists_only_v2_bundles(tmp_path: Path, monkeypatch) -> None:
 
     assert [m["id"] for m in data] == ["valid"]
     assert data[0]["context_window"] == 1024
+    assert "cactus" not in data[0]
 
 
 def test_chat_completion_shapes_openai_response(tmp_path: Path, monkeypatch) -> None:
@@ -56,6 +61,9 @@ def test_chat_completion_shapes_openai_response(tmp_path: Path, monkeypatch) -> 
             "success": True,
             "response": "hi",
             "function_calls": [],
+            "confidence": 0.91,
+            "confidence_threshold": 0.8,
+            "cloud_handoff": False,
             "prefill_tokens": 2,
             "decode_tokens": 1,
         }
@@ -75,6 +83,9 @@ def test_chat_completion_shapes_openai_response(tmp_path: Path, monkeypatch) -> 
     assert body["object"] == "chat.completion"
     assert body["choices"][0]["message"]["content"] == "hi"
     assert body["usage"] == {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+    assert body["model"] == "llm"
+    assert "cactus" not in body
+    assert "cloud_handoff" not in body
 
 
 _WRAPPED_LOOKUP = [{"type": "function", "function": {"name": "lookup", "description": "", "parameters": {}}}]
@@ -134,6 +145,8 @@ def test_streaming_chat_sends_wrapped_tools(tmp_path: Path, monkeypatch) -> None
 
     assert '"finish_reason": "tool_calls"' in body
     assert "data: [DONE]" in body
+    assert '"cactus"' not in body
+    assert '"cloud_handoff"' not in body
     assert captured["tools"] == _WRAPPED_LOOKUP
 
 
@@ -153,6 +166,164 @@ def test_tool_choice_object_selects_wrapped_tool(tmp_path: Path, monkeypatch) ->
 
     assert res.status_code == 200
     assert captured["tools"] == _WRAPPED_LOOKUP
+
+
+def _continuation_messages(*, result_order: tuple[str, ...] = ("lookup", "message")) -> list[dict]:
+    calls = {
+        "lookup": {
+            "id": "call_lookup",
+            "type": "function",
+            "function": {
+                "name": "search_for_contact",
+                "arguments": '{"name":"Alice"}',
+            },
+        },
+        "message": {
+            "id": "call_message",
+            "type": "function",
+            "function": {
+                "name": "send_instant_message",
+                "arguments": '{"contact_id":"contact-42","text":"I am here"}',
+            },
+        },
+    }
+    results = {
+        "lookup": {"role": "tool", "tool_call_id": "call_lookup", "content": '{"contact_id":"contact-42"}'},
+        "message": {"role": "tool", "tool_call_id": "call_message", "content": '{"sent":true}'},
+    }
+    return [
+        {"role": "user", "content": "Find Alice and message her"},
+        {"role": "assistant", "content": "", "tool_calls": [calls["lookup"], calls["message"]]},
+        *(results[name] for name in result_order),
+    ]
+
+
+def test_chat_replays_tool_results_in_assistant_call_order(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(server, "cactus_reset", lambda handle: None)
+
+    def fake_complete(handle, messages, options, tools, callback):
+        captured["messages"] = messages
+        return {"success": True, "response": "", "function_calls": []}
+
+    monkeypatch.setattr(server, "cactus_complete", fake_complete)
+
+    with TestClient(app) as client:
+        res = client.post("/v1/chat/completions", json={
+            "model": "llm",
+            "messages": _continuation_messages(result_order=("message", "lookup")),
+        })
+
+    assert res.status_code == 200
+    assert captured["messages"] == _continuation_messages()
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {"role": "user", "content": "message Alice"},
+            {"role": "tool", "tool_call_id": "call_missing", "content": "{}"},
+        ],
+        [
+            {"role": "user", "content": "message Alice"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_lookup",
+                    "type": "function",
+                    "function": {"name": "search_for_contact", "arguments": "{}"},
+                }],
+            },
+        ],
+        [
+            {"role": "user", "content": "message Alice"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_lookup",
+                    "type": "function",
+                    "function": {"name": "search_for_contact", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_lookup", "content": "{}"},
+            {"role": "tool", "tool_call_id": "call_lookup", "content": "{}"},
+        ],
+        [
+            {"role": "user", "content": "message Alice"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_duplicate",
+                        "type": "function",
+                        "function": {"name": "search_for_contact", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_duplicate",
+                        "type": "function",
+                        "function": {"name": "search_for_contact", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_duplicate", "content": "{}"},
+        ],
+    ],
+)
+def test_chat_rejects_invalid_tool_transcripts(tmp_path: Path, monkeypatch, messages: list[dict]) -> None:
+    app = _app(tmp_path, monkeypatch)
+
+    def unexpected_complete(*args, **kwargs):
+        pytest.fail("invalid transcript reached inference")
+
+    monkeypatch.setattr(server, "cactus_complete", unexpected_complete)
+
+    with TestClient(app) as client:
+        res = client.post("/v1/chat/completions", json={"model": "llm", "messages": messages})
+
+    assert res.status_code == 400
+
+
+def test_legacy_needle_rejects_tool_continuation(tmp_path: Path, monkeypatch) -> None:
+    _bundle(tmp_path, "needle", "needle")
+    monkeypatch.setattr(server, "cactus_init", lambda *args, **kwargs: object())
+    monkeypatch.setattr(server, "cactus_destroy", lambda handle: None)
+    monkeypatch.setattr(server, "cactus_complete", lambda *args, **kwargs: pytest.fail("reached inference"))
+    app = server.create_app(weights_root=tmp_path, default_model="needle", preload=False)
+
+    with TestClient(app) as client:
+        res = client.post(
+            "/v1/chat/completions",
+            json={"model": "needle", "messages": _continuation_messages()},
+        )
+
+    assert res.status_code == 400
+    assert "single-turn" in res.json()["detail"]
+
+
+def test_legacy_needle_allows_single_turn(tmp_path: Path, monkeypatch) -> None:
+    _bundle(tmp_path, "needle", "needle")
+    monkeypatch.setattr(server, "cactus_init", lambda *args, **kwargs: object())
+    monkeypatch.setattr(server, "cactus_destroy", lambda handle: None)
+    monkeypatch.setattr(server, "cactus_reset", lambda handle: None)
+    monkeypatch.setattr(
+        server,
+        "cactus_complete",
+        lambda *args, **kwargs: {"success": True, "response": "", "function_calls": []},
+    )
+    app = server.create_app(weights_root=tmp_path, default_model="needle", preload=False)
+
+    with TestClient(app) as client:
+        res = client.post(
+            "/v1/chat/completions",
+            json={"model": "needle", "messages": [{"role": "user", "content": "Find Alice"}]},
+        )
+
+    assert res.status_code == 200
 
 
 def test_streaming_completion_error_terminates(tmp_path: Path, monkeypatch) -> None:

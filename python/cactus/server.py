@@ -48,6 +48,7 @@ class ModelInfo:
     context_length: int
     created: int
     supports_embedding: bool = False
+    supports_tool_continuation: bool = False
 
 
 class ModelRegistry:
@@ -86,6 +87,10 @@ class ModelRegistry:
         return "text_embedding" in names or "decoder_embed_chunk" in names
 
     @classmethod
+    def _read_config_bool(cls, model_dir: Path, field: str) -> bool:
+        return cls._read_config_field(model_dir, field).lower() in {"1", "true", "yes", "on"}
+
+    @classmethod
     def _info_for_dir(cls, path: Path) -> ModelInfo | None:
         display_id = path.expanduser().name
         resolved = path.expanduser().resolve()
@@ -104,6 +109,7 @@ class ModelRegistry:
             context_length=context_length,
             created=int(stat.st_mtime),
             supports_embedding=cls._supports_embedding(resolved),
+            supports_tool_continuation=cls._read_config_bool(resolved, "supports_tool_continuation"),
         )
 
     def _discover(self, root: Path) -> None:
@@ -368,6 +374,76 @@ def _flatten_message(msg: ChatMessage) -> dict[str, Any]:
     return out
 
 
+def _invalid_transcript(detail: str) -> None:
+    raise HTTPException(status_code=400, detail=f"Invalid tool transcript: {detail}")
+
+
+def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate tool-call linkage and order parallel results by call ID."""
+    normalized: list[dict[str, Any]] = []
+    seen_call_ids: set[str] = set()
+    index = 0
+
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") == "tool":
+            _invalid_transcript("a tool result has no preceding assistant call batch")
+
+        tool_calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+        if not tool_calls:
+            normalized.append(message)
+            index += 1
+            continue
+        if not isinstance(tool_calls, list):
+            _invalid_transcript("assistant tool_calls must be a list")
+
+        call_ids: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                _invalid_transcript("assistant tool calls must be objects")
+            call_id = call.get("id")
+            function = call.get("function")
+            if not isinstance(call_id, str) or not call_id:
+                _invalid_transcript("every assistant tool call needs a non-empty id")
+            if call_id in seen_call_ids or call_id in call_ids:
+                _invalid_transcript(f"duplicate assistant tool call id '{call_id}'")
+            if not isinstance(function, dict) or not isinstance(function.get("name"), str) or not function["name"]:
+                _invalid_transcript(f"tool call '{call_id}' has no function name")
+            seen_call_ids.add(call_id)
+            call_ids.append(call_id)
+
+        normalized.append(message)
+        results_by_id: dict[str, dict[str, Any]] = {}
+        result_index = index + 1
+        while len(results_by_id) < len(call_ids):
+            if result_index >= len(messages):
+                missing = next(call_id for call_id in call_ids if call_id not in results_by_id)
+                _invalid_transcript(f"missing result for tool call '{missing}'")
+            result = messages[result_index]
+            if result.get("role") != "tool":
+                missing = next(call_id for call_id in call_ids if call_id not in results_by_id)
+                _invalid_transcript(f"missing result for tool call '{missing}'")
+            result_id = result.get("tool_call_id")
+            if not isinstance(result_id, str) or not result_id:
+                _invalid_transcript("every tool result needs a non-empty tool_call_id")
+            if result_id not in call_ids:
+                _invalid_transcript(f"tool result references unknown call id '{result_id}'")
+            if result_id in results_by_id:
+                _invalid_transcript(f"duplicate result for tool call '{result_id}'")
+            results_by_id[result_id] = result
+            result_index += 1
+
+        normalized.extend(results_by_id[call_id] for call_id in call_ids)
+        index = result_index
+
+    return normalized
+
+
+def _needle_requires_tool_continuation(messages: list[dict[str, Any]]) -> bool:
+    user_turns = sum(message.get("role") == "user" for message in messages)
+    return user_turns > 1 or any(message.get("role") in {"assistant", "tool"} for message in messages)
+
+
 def _translate_tools(tools: list[Tool] | None, tool_choice) -> tuple[list[dict[str, Any]] | None, bool]:
     if not tools or tool_choice == "none":
         return None, False
@@ -552,7 +628,11 @@ def _strip_tool_call_markers(text: str) -> str:
     return s.strip() if s != text else text
 
 
-def _build_chat_response(result: dict[str, Any], model_id: str, request_id: str) -> dict[str, Any]:
+def _build_chat_response(
+    result: dict[str, Any],
+    info: ModelInfo,
+    request_id: str,
+) -> dict[str, Any]:
     function_calls = result.get("function_calls") or []
     tool_calls = _make_tool_calls(function_calls)
     has_tool_calls = bool(tool_calls)
@@ -569,7 +649,7 @@ def _build_chat_response(result: dict[str, Any], model_id: str, request_id: str)
         "id": request_id,
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": model_id,
+        "model": info.id,
         "choices": [{
             "index": 0,
             "message": message,
@@ -581,7 +661,6 @@ def _build_chat_response(result: dict[str, Any], model_id: str, request_id: str)
             "completion_tokens": decode,
             "total_tokens": prefill + decode,
         },
-        "cloud_handoff": bool(result.get("cloud_handoff", False)),
     }
 
 
@@ -589,7 +668,15 @@ def _event(data: dict[str, Any]) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
-async def _stream_completion(manager: ModelManager, req: ChatRequest, request_id: str, messages, options, tools):
+async def _stream_completion(
+    manager: ModelManager,
+    req: ChatRequest,
+    info: ModelInfo,
+    request_id: str,
+    messages,
+    options,
+    tools,
+):
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -619,7 +706,7 @@ async def _stream_completion(manager: ModelManager, req: ChatRequest, request_id
         "id": request_id,
         "object": "chat.completion.chunk",
         "created": created,
-        "model": req.model,
+        "model": info.id,
         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "logprobs": None, "finish_reason": None}],
     })
 
@@ -633,7 +720,7 @@ async def _stream_completion(manager: ModelManager, req: ChatRequest, request_id
             "id": request_id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": req.model,
+            "model": info.id,
             "choices": [{"index": 0, "delta": {field: text}, "logprobs": None, "finish_reason": None}],
         })
 
@@ -672,7 +759,7 @@ async def _stream_completion(manager: ModelManager, req: ChatRequest, request_id
             "id": request_id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": req.model,
+            "model": info.id,
             "choices": [{"index": 0, "delta": {}, "logprobs": None, "finish_reason": "stop"}],
         })
         yield "data: [DONE]\n\n"
@@ -691,21 +778,20 @@ async def _stream_completion(manager: ModelManager, req: ChatRequest, request_id
             "id": request_id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": req.model,
+            "model": info.id,
             "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}, "logprobs": None, "finish_reason": None}],
         })
     final = {
         "id": request_id,
         "object": "chat.completion.chunk",
         "created": created,
-        "model": req.model,
+        "model": info.id,
         "choices": [{"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish_reason}],
         "usage": {
             "prompt_tokens": int((result or {}).get("prefill_tokens") or 0),
             "completion_tokens": int((result or {}).get("decode_tokens") or 0),
             "total_tokens": int((result or {}).get("total_tokens") or 0),
         },
-        "cloud_handoff": bool((result or {}).get("cloud_handoff", False)),
     }
     yield _event(final)
     yield "data: [DONE]\n\n"
@@ -776,7 +862,19 @@ def create_app(
         info = reg.require(req.model)
         if info.model_type not in LLM_MODEL_TYPES:
             raise HTTPException(status_code=400, detail=f"Model '{req.model}' is not an LLM model")
-        messages = [_flatten_message(m) for m in req.messages]
+        messages = _normalize_messages([_flatten_message(m) for m in req.messages])
+        if (
+            info.model_type == "needle"
+            and not info.supports_tool_continuation
+            and _needle_requires_tool_continuation(messages)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{info.id}' supports only single-turn Needle requests; "
+                    "use a continuation-capable model for assistant/tool transcripts"
+                ),
+            )
         tools, force_tools = _translate_tools(req.tools, req.tool_choice)
         options = _chat_options(req)
         if "max_tokens" not in options:
@@ -794,7 +892,15 @@ def create_app(
         mgr: ModelManager = request.app.state.manager
         if req.stream:
             return StreamingResponse(
-                _stream_completion(mgr, req, request_id, messages, options or None, tools),
+                _stream_completion(
+                    mgr,
+                    req,
+                    info,
+                    request_id,
+                    messages,
+                    options or None,
+                    tools,
+                ),
                 media_type="text/event-stream",
             )
         async with mgr.acquire(req.model) as slot:
@@ -806,7 +912,7 @@ def create_app(
                 )
         if not result.get("success", False):
             raise HTTPException(status_code=500, detail=result.get("error") or "completion failed")
-        return _build_chat_response(result, req.model, request_id)
+        return _build_chat_response(result, info, request_id)
 
     @app.post("/v1/audio/transcriptions")
     async def create_transcription(

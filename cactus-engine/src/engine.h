@@ -102,7 +102,7 @@ struct Config {
     float rescale_factor = 0.00392156862745098f;
     float image_mean = 0.5f;
     float image_std = 0.5f;
-    
+
     uint32_t downsample_factor = 2;
     uint32_t min_tiles = 2;
     uint32_t max_tiles = 10;
@@ -256,13 +256,14 @@ struct MergeRule {
     std::string second;
     std::string merged;
     uint32_t priority;
-    
+
     MergeRule(const std::string& f, const std::string& s, const std::string& m, uint32_t p)
         : first(f), second(s), merged(m), priority(p) {}
 };
 
 
 struct ToolCallInfo {
+    std::string id;
     std::string name;
     std::string arguments;
 };
@@ -271,6 +272,7 @@ struct ChatMessage {
     std::string role;
     std::string content;
     std::string name;
+    std::string tool_call_id;
     std::vector<std::string> images;
     std::vector<std::string> audio;
     size_t audio_soft_token_count = 0;
@@ -345,7 +347,7 @@ public:
     std::string get_default_stop_sequence() const;
 
     virtual bool load_vocabulary_with_config(const std::string& vocab_file, const std::string& merges_file, const std::string& config_file) = 0;
-    
+
     uint32_t get_image_token_id() const { return image_token_id_; }
     uint32_t get_fake_token_id() const { return fake_token_id_; }
     uint32_t get_global_img_token_id() const { return global_img_token_id_; }
@@ -398,7 +400,7 @@ protected:
     ModelVariant model_variant_ = ModelVariant::DEFAULT;
     bool has_chat_template_ = false;
     std::string chat_template_;
-    
+
     uint32_t image_token_id_ = 396;
     uint32_t fake_token_id_ = 49189;
     uint32_t global_img_token_id_ = 49152;
@@ -465,7 +467,7 @@ private:
     std::unordered_map<std::string, uint32_t> token_to_id_;
     std::vector<std::string> id_to_token_;
     std::vector<MergeRule> merge_rules_;
-    std::unordered_map<std::string, uint32_t> merge_map_;  
+    std::unordered_map<std::string, uint32_t> merge_map_;
 
     uint32_t vocab_size_;
     uint32_t unk_token_id_;
@@ -480,14 +482,14 @@ private:
 
     std::vector<std::string> apply_bpe(const std::vector<std::string>& tokens) const;
     std::pair<int, uint32_t> find_best_merge_fast(const std::vector<std::string>& tokens) const;
-    
+
     std::string bytes_to_unicode(const std::string& text) const;
     std::string unicode_to_bytes(const std::string& text) const;
     std::vector<std::string> byte_level_split(const std::string& text) const;
     std::vector<std::string> utf8_split(const std::string& text) const;
 
     void cleanup_mmap();
-    
+
 private:
     mutable std::unordered_map<uint8_t, std::string> byte_to_unicode_;
     mutable std::unordered_map<std::string, uint8_t> unicode_to_byte_;

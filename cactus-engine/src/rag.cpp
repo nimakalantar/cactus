@@ -18,6 +18,7 @@ static constexpr float RRF_EMB_WEIGHT = 0.8f;
 static constexpr float RRF_BM25_WEIGHT = 0.2f;
 static constexpr float BM25_K1 = 1.5f;
 static constexpr float BM25_B = 0.75f;
+static constexpr float BM25_MIN_RELATIVE_SCORE = 0.5f;
 
 static std::vector<std::pair<float, size_t>> compute_rrf_scores(
     const std::vector<std::pair<float, size_t>>& emb_ranked,
@@ -212,6 +213,73 @@ static std::string tool_to_text(const ToolFunction& tool) {
     return tool.name + " " + tool.description;
 }
 
+static std::vector<std::pair<float, size_t>> rank_tools_by_bm25(
+    const std::string& query,
+    const std::vector<ToolFunction>& tools
+) {
+    auto query_words = tokenize_words(query);
+    float total_len = 0.0f;
+    std::unordered_map<std::string, int> doc_freqs;
+    std::vector<std::string> tool_texts;
+    tool_texts.reserve(tools.size());
+
+    for (const auto& tool : tools) {
+        std::string text = tool_to_text(tool);
+        auto words = tokenize_words(text);
+        total_len += words.size();
+        std::unordered_set<std::string> unique_words(words.begin(), words.end());
+        for (const auto& word : unique_words) {
+            doc_freqs[word]++;
+        }
+        tool_texts.push_back(std::move(text));
+    }
+
+    float avg_doc_len = tools.empty() ? 1.0f : total_len / tools.size();
+    if (avg_doc_len <= 0.0f) {
+        avg_doc_len = 1.0f;
+    }
+
+    std::vector<std::pair<float, size_t>> ranked;
+    ranked.reserve(tools.size());
+    for (size_t i = 0; i < tool_texts.size(); ++i) {
+        ranked.emplace_back(
+            compute_bm25_score(query_words, tool_texts[i], avg_doc_len, doc_freqs, tools.size()),
+            i
+        );
+    }
+
+    std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+        if (left.first != right.first) return left.first > right.first;
+        return left.second < right.second;
+    });
+    return ranked;
+}
+
+static std::vector<ToolFunction> select_ranked_tools(
+    const std::vector<ToolFunction>& all_tools,
+    const std::vector<std::pair<float, size_t>>& ranked,
+    size_t top_k
+) {
+    if (ranked.empty()) return {};
+
+    size_t selection_limit = std::min(top_k, ranked.size());
+    if (ranked.front().first > 0.0f) {
+        float minimum_score = ranked.front().first * BM25_MIN_RELATIVE_SCORE;
+        selection_limit = 1;
+        while (selection_limit < top_k && selection_limit < ranked.size() &&
+               ranked[selection_limit].first >= minimum_score) {
+            ++selection_limit;
+        }
+    }
+
+    std::vector<ToolFunction> selected;
+    selected.reserve(selection_limit);
+    for (size_t i = 0; i < selection_limit; ++i) {
+        selected.push_back(all_tools[ranked[i].second]);
+    }
+    return selected;
+}
+
 static float cosine_similarity(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size() || a.empty()) return 0.0f;
 
@@ -244,6 +312,8 @@ std::vector<cactus::ffi::ToolFunction> select_relevant_tools(
         return all_tools;
     }
 
+    auto bm25_ranked = rank_tools_by_bm25(query, all_tools);
+
     // Build tool texts and embeddings if not cached or tool set changed
     bool need_recompute = (handle->tool_texts.size() != all_tools.size());
     if (!need_recompute) {
@@ -272,10 +342,10 @@ std::vector<cactus::ffi::ToolFunction> select_relevant_tools(
                     std::vector<float> emb = handle->model->get_text_embeddings(tokens, true);
                     handle->tool_embeddings.push_back(std::move(emb));
                 } catch (const std::exception& e) {
-                    CACTUS_LOG_WARN("tool_rag", "get_embeddings unavailable, returning all tools: " << e.what());
+                    CACTUS_LOG_WARN("tool_rag", "get_embeddings unavailable, using BM25 tool ranking: " << e.what());
                     handle->tool_texts.clear();
                     handle->tool_embeddings.clear();
-                    return all_tools;
+                    return select_ranked_tools(all_tools, bm25_ranked, top_k);
                 }
             } else {
                 handle->tool_embeddings.push_back({});
@@ -294,40 +364,18 @@ std::vector<cactus::ffi::ToolFunction> select_relevant_tools(
     try {
         query_embedding = handle->model->get_text_embeddings(query_tokens, true);
     } catch (const std::exception& e) {
-        CACTUS_LOG_WARN("tool_rag", "get_embeddings unavailable, returning all tools: " << e.what());
-        return all_tools;
+        CACTUS_LOG_WARN("tool_rag", "get_embeddings unavailable, using BM25 tool ranking: " << e.what());
+        return select_ranked_tools(all_tools, bm25_ranked, top_k);
     }
     if (query_embedding.empty()) {
-        CACTUS_LOG_WARN("tool_rag", "Failed to get query embedding, returning all tools");
-        return all_tools;
+        CACTUS_LOG_WARN("tool_rag", "Failed to get query embedding, using BM25 tool ranking");
+        return select_ranked_tools(all_tools, bm25_ranked, top_k);
     }
-
-    auto query_words = tokenize_words(query);
-
-    float total_len = 0.0f;
-    std::unordered_map<std::string, int> doc_freqs;
-    for (const auto& text : handle->tool_texts) {
-        auto words = tokenize_words(text);
-        total_len += words.size();
-        std::unordered_set<std::string> unique_words(words.begin(), words.end());
-        for (const auto& w : unique_words) {
-            doc_freqs[w]++;
-        }
-    }
-    float avg_doc_len = total_len / handle->tool_texts.size();
 
     std::vector<std::pair<float, size_t>> emb_ranked;
     for (size_t i = 0; i < handle->tool_embeddings.size(); ++i) {
         float sim = cosine_similarity(query_embedding, handle->tool_embeddings[i]);
         emb_ranked.emplace_back(sim, i);
-    }
-
-    std::vector<std::pair<float, size_t>> bm25_ranked;
-    for (size_t i = 0; i < handle->tool_texts.size(); ++i) {
-        float bm25 = compute_bm25_score(
-            query_words, handle->tool_texts[i], avg_doc_len, doc_freqs, handle->tool_texts.size()
-        );
-        bm25_ranked.emplace_back(bm25, i);
     }
 
     auto rrf_scored = compute_rrf_scores(emb_ranked, bm25_ranked, all_tools.size());
