@@ -84,10 +84,85 @@ bool test_needle_tool_call() {
     return ok;
 }
 
+bool test_needle_tool_rag_without_embeddings() {
+    std::cout << "\n╔══════════════════════════════════════════╗\n"
+              << "║       NEEDLE TOOL-RAG FALLBACK TEST      ║\n"
+              << "╚══════════════════════════════════════════╝\n";
+    if (!g_model_path) {
+        std::cout << "  [WARN] CACTUS_TEST_MODEL not set; skipping\n";
+        return true;
+    }
+    if (!model_is_needle(g_model_path)) {
+        std::cout << "  [SKIP] model under test is not needle; skipping needle tool-RAG test\n";
+        return true;
+    }
+
+    cactus_model_t model = cactus_init(g_model_path, nullptr, false);
+    if (!model) {
+        std::cerr << "  [✗] Failed to initialize needle model at " << g_model_path << "\n";
+        return false;
+    }
+
+    const char* messages = R"([
+        {"role": "user", "content": "add buy toothpaste to my todo list"}
+    ])";
+
+    const char* tools = R"([
+        {
+            "type": "function",
+            "function": {
+                "name": "HassListAddItem",
+                "description": "Add item to a todo list",
+                "parameters": {"type": "object", "properties": {"item": {"type": "string"}, "name": {"type": "string"}}, "required": ["item", "name"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "HassListCompleteItem",
+                "description": "Complete item on a todo list",
+                "parameters": {"type": "object", "properties": {"item": {"type": "string"}, "name": {"type": "string"}}, "required": ["item", "name"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "HassListRemoveItem",
+                "description": "Remove one or more items from a todo list",
+                "parameters": {"type": "object", "properties": {"item": {"type": "string"}, "name": {"type": "string"}}, "required": ["item", "name"]}
+            }
+        }
+    ])";
+
+    const char* options = R"({"max_tokens": 64, "force_tools": true, "telemetry_enabled": false, "auto_handoff": false})";
+
+    char response[1 << 15] = {0};
+    int rc = cactus_complete(model, messages, response, sizeof(response), options, tools,
+                             nullptr, nullptr, nullptr, 0);
+    std::string r(response);
+
+    std::cout << "├─ rc: " << rc << "\n";
+    std::cout << "├─ Response: " << r << "\n";
+
+    const bool calls_add = r.find("HassListAddItem") != std::string::npos;
+    const bool avoids_complete = r.find("HassListCompleteItem") == std::string::npos;
+    const bool has_item = r.find("buy toothpaste") != std::string::npos;
+    std::cout << "├─ Selects add-item: " << (calls_add ? "YES" : "NO") << "\n";
+    std::cout << "├─ Excludes complete-item: " << (avoids_complete ? "YES" : "NO") << "\n";
+    std::cout << "├─ Item arg present: " << (has_item ? "YES" : "NO") << "\n";
+
+    const bool ok = rc > 0 && calls_add && avoids_complete && has_item;
+    std::cout << "└─ Status: " << (ok ? "PASSED ✓" : "FAILED ✗") << "\n";
+
+    cactus_destroy(model);
+    return ok;
+}
+
 int main() {
     TestUtils::apply_backend();
     bool ok = true;
     ok &= test_needle_tool_call();
+    ok &= test_needle_tool_rag_without_embeddings();
     std::cout << "\n" << (ok ? "✓ needle tool-call test passed" : "✗ needle tool-call test failed") << "\n";
     return ok ? 0 : 1;
 }
