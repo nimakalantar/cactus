@@ -290,6 +290,31 @@ struct LengthTokenizer : public Tokenizer {
     bool load_vocabulary_with_config(const std::string&, const std::string&, const std::string&) override { return true; }
 };
 
+struct CharacterTokenizer : public Tokenizer {
+    static uint32_t token_id(char ch) {
+        return static_cast<uint32_t>(static_cast<unsigned char>(ch)) + 4;
+    }
+
+    std::vector<uint32_t> encode(const std::string& text) const override {
+        std::vector<uint32_t> tokens;
+        tokens.reserve(text.size());
+        for (char ch : text) tokens.push_back(token_id(ch));
+        return tokens;
+    }
+    std::string decode(const std::vector<uint32_t>& tokens) const override {
+        std::string text;
+        for (uint32_t token : tokens) {
+            if (token >= 4 && token < 260) text.push_back(static_cast<char>(token - 4));
+        }
+        return text;
+    }
+    uint32_t get_vocab_size() const override { return 260; }
+    uint32_t get_unk_token() const override { return 1; }
+    uint32_t get_bos_token() const override { return 2; }
+    uint32_t get_eos_token() const override { return 3; }
+    bool load_vocabulary_with_config(const std::string&, const std::string&, const std::string&) override { return true; }
+};
+
 bool test_tool_constraint_clear_releases_bias() {
     LengthTokenizer tok;
     ToolCallConstrainer constrainer;
@@ -302,6 +327,35 @@ bool test_tool_constraint_clear_releases_bias() {
     constrainer.init(Config::ModelType::GEMMA4, {}, &tok);
     if (!constrainer.get_bias().empty()) {
         std::cerr << "  stale bias survived deactivating init\n";
+        return false;
+    }
+    return true;
+}
+
+bool test_needle_tool_constraint_enforces_string_enum() {
+    CharacterTokenizer tokenizer;
+    ToolCallConstrainer constrainer;
+    constrainer.init(
+        Config::ModelType::NEEDLE,
+        {{"HassListAddItem", {"item", "name"}, {{}, {"Shopping List"}}, {"item", "name"}}},
+        &tokenizer
+    );
+
+    const std::string prefix =
+        R"([{"name":"HassListAddItem","arguments":{"name":")";
+    for (char ch : prefix) {
+        constrainer.update(CharacterTokenizer::token_id(ch), std::string(1, ch));
+    }
+
+    const auto* bias = constrainer.get_dense_bias();
+    if (!bias) {
+        std::cerr << "  expected dense enum bias for Needle string value\n";
+        return false;
+    }
+    const float allowed = (*bias)[CharacterTokenizer::token_id('S')];
+    const float blocked = (*bias)[CharacterTokenizer::token_id('b')];
+    if (allowed != 0.0f || blocked > -1e8f) {
+        std::cerr << "  Needle enum constraint allowed an out-of-schema prefix\n";
         return false;
     }
     return true;
@@ -747,6 +801,7 @@ int main() {
     runner.run_test("tool_calls", test_tool_call());
     runner.run_test("tool_multiple_tool_call_invocations", test_multiple_tool_call_invocations());
     runner.run_test("tool_constraint_clear_releases_bias", test_tool_constraint_clear_releases_bias());
+    runner.run_test("needle_tool_constraint_enforces_string_enum", test_needle_tool_constraint_enforces_string_enum());
     runner.run_test("partition_thinking_response", test_partition_thinking_response());
     runner.run_test("prompt_retains_thinking", test_prompt_gemma4_retains_thinking());
     runner.run_test("complete_thinking_api_clean", test_complete_gemma4_thinking_api_clean());
